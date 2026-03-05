@@ -1,0 +1,92 @@
+{
+  "documents": {
+    "doc-1772607780301-5uzy2t": {
+      "id": "doc-1772607780301-5uzy2t",
+      "ownerId": "user-1772607775900-kssmhz",
+      "title": "test001 doc",
+      "author": "A",
+      "lastModifiedAt": "2026-03-04T07:06:18.184Z",
+      "preview": "test B 12345 12345",
+      "visibility": "shared",
+      "roomName": "document:doc-1772607780301-5uzy2t",
+      "content": "<h1>test</h1><p>B</p><p></p><p>12345</p><p></p><p></p><p>12345</p>"
+    }
+  },
+  "knowledgeBases": {
+    "kb-1772604778315-fodnsn": {
+      "id": "kb-1772604778315-fodnsn",
+      "ownerId": "user-1772604708420-dxavfd",
+      "title": "Untitled Knowledge Note Copy",
+      "author": "Easton",
+      "description": "Reusable note for your knowledge base.",
+      "tags": [
+        "note"
+      ],
+      "relatedDocumentIds": [],
+      "relatedKnowledgeBaseIds": [],
+      "lastModifiedAt": "2026-03-04T06:15:46.786Z",
+      "preview": "123 1 333",
+      "visibility": "private",
+      "roomName": "knowledge:kb-1772604778315-fodnsn",
+      "content": "<p>123 1</p><p></p><p></p><p>333</p>"
+    }
+  },
+  "version": 1,
+  "recent": {
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJBY2NvdW50LVNZUyIsInVzZXJOYW1lIjoiOTkyNjU3NTI5OGMzMDJmZDA5MmZmYmM1YWU2YTBiMTc4NjEzMTU2ZjM5NGIyZGNkYThkZDAwZDQwMmVmNGE4NCIsImV4cCI6MTczMTQwMTA2MywiaWF0IjoxNzMwMTkxNDYzfQ.Jc2fFCnr_AmjgJBuSOFQBO_u_N0x-c1tE9Zu8VwNEBw": {
+      "documents": [],
+      "knowledgeBases": []
+    },
+    "user-1772604708420-dxavfd": {
+      "documents": [],
+      "knowledgeBases": [
+        {
+          "id": "kb-1772604778315-fodnsn",
+          "title": "Untitled Knowledge Note Copy"
+        }
+      ]
+    },
+    "user-1772604892477-bly1gc": {
+      "documents": [],
+      "knowledgeBases": []
+    },
+    "user-1772604913852-ehbxe8": {
+      "documents": [],
+      "knowledgeBases": []
+    },
+    "user-1772607775900-kssmhz": {
+      "documents": [
+        {
+          "id": "doc-1772607780301-5uzy2t",
+          "title": "test001 doc"
+        }
+      ],
+      "knowledgeBases": []
+    },
+    "user-1772607875256-nze89g": {
+      "documents": [
+        {
+          "id": "doc-1772607780301-5uzy2t",
+          "title": "test001 doc"
+        }
+      ],
+      "knowledgeBases": []
+    }
+  },
+  "users": {
+    "user-1772607775900-kssmhz": {
+      "id": "user-1772607775900-kssmhz",
+      "name": "A",
+      "password": "12345",
+      "color": "#1677ff",
+      "createdAt": "2026-03-04T07:02:55.900Z"
+    },
+    "user-1772607875256-nze89g": {
+      "id": "user-1772607875256-nze89g",
+      "name": "B",
+      "password": "12345",
+      "color": "#ef4444",
+      "createdAt": "2026-03-04T07:04:35.256Z"
+    }
+  }
+}
