@@ -12,7 +12,7 @@ import {
   LocalWorkspaceStore,
 } from "./storage.js";
 import { sendError, sendSuccess } from "./response.js";
-import { setPersistence, setupWSConnection } from "./utils.js";
+import { docs as activeDocs, setPersistence, setupWSConnection } from "./utils.js";
 
 const HOST = process.env.HOST || "localhost";
 const PORT = Number(process.env.PORT || "8888");
@@ -85,6 +85,20 @@ function disconnectUnauthorizedRoomClients(roomName) {
     }
 
     client.close(4001, "permission-updated");
+  });
+}
+
+function disconnectRoomClients(roomName, code = 4002, reason = "room-reset") {
+  wss.clients.forEach((client) => {
+    if (client.readyState !== 1) {
+      return;
+    }
+
+    if (client.roomName !== roomName) {
+      return;
+    }
+
+    client.close(code, reason);
   });
 }
 
@@ -182,6 +196,82 @@ async function askAiAboutDocument({ title, content, prompt, mode }) {
   const result = await response.json();
   return result?.choices?.[0]?.message?.content?.trim() || "AI did not return a valid answer.";
 }
+
+function createRuntimeId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function flattenThreadsToLegacyComments(threads = []) {
+  const comments = [];
+
+  threads.forEach((thread) => {
+    const rootCommentId = thread?.comments?.[0]?.id || null;
+    thread.comments.forEach((comment, index) => {
+      const user = store.getUserById(comment.authorId);
+      comments.push({
+        id: comment.id,
+        parentId: index === 0 ? null : rootCommentId,
+        uid: comment.authorId,
+        content: comment.content,
+        createTime: comment.createdAt,
+        user: {
+          username: user?.nickname || user?.name || comment.authorName || "Unknown",
+          avatar: user?.avatar || "",
+        },
+        reply: null,
+      });
+    });
+  });
+
+  return comments.sort((left, right) => new Date(right.createTime).getTime() - new Date(left.createTime).getTime());
+}
+
+function appendLegacyCommentToThreads(threads = [], { parentId, authorId, content }) {
+  const createdAt = new Date().toISOString();
+  const author = store.getUserById(authorId);
+  const nextComment = {
+    id: createRuntimeId("comment"),
+    authorId,
+    authorName: author?.nickname || author?.name || "Unknown",
+    content,
+    createdAt,
+  };
+
+  if (!parentId) {
+    return {
+      comment: nextComment,
+      threads: [
+        {
+          id: createRuntimeId("thread"),
+          excerpt: stripHtml(content).slice(0, 120),
+          createdAt,
+          updatedAt: createdAt,
+          comments: [nextComment],
+        },
+        ...threads,
+      ],
+    };
+  }
+
+  const nextThreads = threads.map((thread) => {
+    const containsParent = thread.comments.some((comment) => comment.id === parentId);
+    if (!containsParent) {
+      return thread;
+    }
+
+    return {
+      ...thread,
+      updatedAt: createdAt,
+      comments: [...thread.comments, nextComment],
+    };
+  });
+
+  return {
+    comment: nextComment,
+    threads: nextThreads,
+  };
+}
+
 app.get("/status", (_req, res) => {
   sendSuccess(res, {
     status: "ok",
@@ -197,7 +287,7 @@ app.get("/metrics", (_req, res) => {
 });
 
 app.post("/api/auth/register", (req, res) => {
-  const name = `${req.body?.name || ""}`.trim();
+  const name = `${req.body?.name || req.body?.username || ""}`.trim();
   const password = `${req.body?.password || ""}`;
 
   if (!name || !password) {
@@ -222,7 +312,7 @@ app.post("/api/auth/register", (req, res) => {
 });
 
 app.post("/api/auth/login", (req, res) => {
-  const name = `${req.body?.name || ""}`.trim();
+  const name = `${req.body?.name || req.body?.username || ""}`.trim();
   const password = `${req.body?.password || ""}`;
 
   if (!name || !password) {
@@ -258,6 +348,16 @@ app.get("/api/auth/me", (req, res) => {
   sendSuccess(res, user);
 });
 
+app.patch("/api/auth/user/profile", (req, res) => {
+  const user = store.updateUserProfile(req.userId, req.body || {});
+  if (!user) {
+    sendError(res, 404, "User not found");
+    return;
+  }
+
+  sendSuccess(res, user, "updated");
+});
+
 app.get("/api/users", (req, res) => {
   sendSuccess(res, store.listUsers(req.userId));
 });
@@ -270,6 +370,16 @@ app.get("/api/documents", (req, res) => {
 app.get("/api/documents/recent", (req, res) => {
   const limit = Number(req.query.limit || 5);
   sendSuccess(res, store.listRecent(req.userId, RESOURCE_KIND_DOCUMENT, limit));
+});
+
+app.get("/api/knowledge-bases/:id/documents", (req, res) => {
+  const knowledgeBase = store.getKnowledgeBase(req.params.id, req.userId);
+  if (!knowledgeBase) {
+    sendError(res, 404, "Knowledge base item not found");
+    return;
+  }
+
+  sendSuccess(res, store.listDocumentsByKnowledgeBase(req.params.id, req.userId));
 });
 
 app.post("/api/documents", (req, res) => {
@@ -291,7 +401,7 @@ app.post("/api/documents/import", upload.single("file"), async (req, res) => {
       return;
     }
 
-    const title = `${req.body?.title || req.file.originalname.replace(/\.[^.]+$/, "")}`.trim() || "瀵煎叆鏂囨。";
+    const title = `${req.body?.title || req.file.originalname.replace(/\.[^.]+$/, "")}`.trim() || "导入文档";
     const author = `${req.body?.author || ""}`.trim();
     const record = store.createDocument(
       {
@@ -320,16 +430,120 @@ app.get("/api/documents/:id", (req, res) => {
   sendSuccess(res, record);
 });
 
+app.get("/api/documents/:id/comment-threads", (req, res) => {
+  const threads = store.getDocumentCommentThreads(req.params.id, req.userId);
+  if (!threads) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  sendSuccess(res, threads);
+});
+
+app.patch("/api/documents/:id/comment-threads", (req, res) => {
+  const threads = Array.isArray(req.body?.threads) ? req.body.threads : [];
+  const updated = store.setDocumentCommentThreads(req.params.id, threads, req.userId);
+  if (!updated) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  sendSuccess(res, updated, "updated");
+});
+
 app.patch("/api/documents/:id", (req, res) => {
+  const existing = store.getDocument(req.params.id, req.userId);
+  if (!existing) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  const nextContent = typeof req.body?.content === "string" ? req.body.content : null;
+  const contentChanged = typeof nextContent === "string" && nextContent !== existing.content;
+  const versionReason = `${req.body?.versionReason || "manual_save"}`.trim() || "manual_save";
+  const versionSummary = `${req.body?.versionSummary || ""}`.trim();
+  const shouldCreateVersion =
+    contentChanged &&
+    req.body?.createVersion !== false &&
+    (versionReason !== "autosave" || store.shouldCreateAutosaveVersion(req.params.id, nextContent, req.userId));
+
   const record = store.updateDocument(req.params.id, req.body || {}, req.userId);
   if (!record) {
     sendError(res, 404, "Document not found");
     return;
   }
 
+  if (shouldCreateVersion) {
+    store.createDocumentVersion(
+      req.params.id,
+      {
+        reason: versionReason,
+        summary: versionSummary,
+      },
+      req.userId
+    );
+  }
+
   disconnectUnauthorizedRoomClients(record.roomName);
   logRequest("documents", "update", record.id);
   sendSuccess(res, record, "updated");
+});
+
+app.get("/api/documents/:id/versions", (req, res) => {
+  const versions = store.listDocumentVersions(req.params.id, req.userId);
+  if (versions === null) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  sendSuccess(
+    res,
+    versions.map(({ roomState, ...version }) => version)
+  );
+});
+
+app.post("/api/documents/:id/versions", (req, res) => {
+  const version = store.createDocumentVersion(req.params.id, req.body || {}, req.userId);
+  if (!version) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  const { roomState, ...versionData } = version;
+  sendSuccess(res, versionData, "version-created");
+});
+
+app.get("/api/document-versions/:id", (req, res) => {
+  const version = store.getDocumentVersion(req.params.id, req.userId);
+  if (!version) {
+    sendError(res, 404, "Version not found");
+    return;
+  }
+
+  const { roomState, ...versionData } = version;
+  sendSuccess(res, versionData);
+});
+
+app.post("/api/document-versions/:id/restore", (req, res) => {
+  const version = store.getDocumentVersion(req.params.id, req.userId);
+  if (!version) {
+    sendError(res, 404, "Version not found");
+    return;
+  }
+
+  const record = store.restoreDocumentVersion(req.params.id, req.userId);
+  if (!record) {
+    sendError(res, 403, "You are not allowed to restore this version");
+    return;
+  }
+
+  disconnectRoomClients(record.roomName, 4002, "version-restored");
+  activeDocs.delete(record.roomName);
+  setTimeout(() => {
+    store.setRoomState(record.roomName, version.roomState);
+  }, 100);
+
+  sendSuccess(res, record, "restored");
 });
 
 app.delete("/api/documents/:id", (req, res) => {
@@ -393,6 +607,87 @@ app.post("/api/documents/:id/ai", async (req, res) => {
     const status = message.includes("AI API is not configured") ? 503 : 500;
     sendError(res, status, message);
   }
+});
+
+app.post("/api/editor/summary", async (req, res) => {
+  const content = `${req.body?.content || ""}`.trim();
+  if (!content) {
+    sendError(res, 400, "Content is required");
+    return;
+  }
+
+  try {
+    const answer = await askAiAboutDocument({
+      title: "Untitled Document",
+      content,
+      prompt: "",
+      mode: "summary",
+    });
+    res.status(200).send(answer);
+  } catch (error) {
+    const message = error.message || "AI request failed";
+    const status = message.includes("AI API is not configured") ? 503 : 500;
+    sendError(res, status, message);
+  }
+});
+
+app.get("/api/comment/commentLists", (req, res) => {
+  const documentId = `${req.query.textId || ""}`.trim();
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.max(1, Number(req.query.pageSize || 10));
+
+  if (!documentId) {
+    sendError(res, 400, "textId is required");
+    return;
+  }
+
+  const threads = store.getDocumentCommentThreads(documentId, req.userId);
+  if (!threads) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  const comments = flattenThreadsToLegacyComments(threads);
+  const start = (page - 1) * pageSize;
+  const list = comments.slice(start, start + pageSize);
+  sendSuccess(res, { list, total: comments.length });
+});
+
+app.post("/api/comment/publish", (req, res) => {
+  const documentId = `${req.body?.textId || ""}`.trim();
+  const content = `${req.body?.content || ""}`.trim();
+  const parentId = req.body?.parentId ? `${req.body.parentId}`.trim() : null;
+
+  if (!documentId || !content) {
+    sendError(res, 400, "textId and content are required");
+    return;
+  }
+
+  const currentThreads = store.getDocumentCommentThreads(documentId, req.userId);
+  if (!currentThreads) {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  const { comment, threads } = appendLegacyCommentToThreads(currentThreads, {
+    parentId,
+    authorId: req.userId,
+    content,
+  });
+  const updated = store.setDocumentCommentThreads(documentId, threads, req.userId);
+  if (!updated) {
+    sendError(res, 500, "Unable to persist comment");
+    return;
+  }
+
+  sendSuccess(
+    res,
+    {
+      id: comment.id,
+      createTime: comment.createdAt,
+    },
+    "published"
+  );
 });
 
 app.get("/api/document-templates", (req, res) => {

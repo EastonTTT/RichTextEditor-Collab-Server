@@ -1,9 +1,34 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import initSqlJs from "sql.js";
 import * as Y from "yjs";
+import {
+  getDocumentCommentThreads as getDocumentCommentThreadsFromStore,
+  setDocumentCommentThreads as setDocumentCommentThreadsFromStore,
+} from "./stores/commentStore.js";
+import {
+  createDocumentVersion as createDocumentVersionFromStore,
+  createDocumentVersionFromRecord as createDocumentVersionFromRecordInStore,
+  getDocumentVersion as getDocumentVersionFromStore,
+  getDocumentVersionNumber as getDocumentVersionNumberFromStore,
+  getLatestDocumentVersion as getLatestDocumentVersionFromStore,
+  listDocumentVersions as listDocumentVersionsFromStore,
+  restoreDocumentVersion as restoreDocumentVersionFromStore,
+  serializeDocumentVersion as serializeDocumentVersionFromStore,
+  shouldCreateAutosaveVersion as shouldCreateAutosaveVersionFromStore,
+  trimDocumentVersions as trimDocumentVersionsFromStore,
+} from "./stores/versionStore.js";
+import {
+  createDocumentFromTemplate as createDocumentFromTemplateInStore,
+  createDocumentTemplate as createDocumentTemplateInStore,
+  deleteDocumentTemplate as deleteDocumentTemplateFromStore,
+  listDocumentTemplates as listDocumentTemplatesFromStore,
+  serializeTemplate as serializeTemplateFromStore,
+} from "./stores/templateStore.js";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.resolve(process.env.WORKSPACE_DATA_DIR || path.join(process.cwd(), "data"));
 const ROOMS_DIR = path.join(DATA_DIR, "rooms");
 const METADATA_FILE = path.join(DATA_DIR, "metadata.json");
 const DB_FILE = path.join(DATA_DIR, "workspace.sqlite");
@@ -13,6 +38,10 @@ const RESOURCE_KIND_KNOWLEDGE = "knowledgeBase";
 const DEFAULT_DOCUMENT_CONTENT = "<h1>Welcome</h1><p>Start writing here...</p>";
 const DEFAULT_KNOWLEDGE_CONTENT =
   "<h1>Knowledge Note</h1><p>Capture reusable notes, links, and references here.</p>";
+const AUTOSAVE_VERSION_REASON = "autosave";
+const AUTOSAVE_MIN_INTERVAL_MS = Number(process.env.AUTOSAVE_MIN_INTERVAL_MS || 10 * 60 * 1000);
+const AUTOSAVE_MIN_TEXT_DELTA = Number(process.env.AUTOSAVE_MIN_TEXT_DELTA || 80);
+const MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT = Number(process.env.MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT || 20);
 
 function ensureStorage() {
   fs.mkdirSync(ROOMS_DIR, { recursive: true });
@@ -51,8 +80,43 @@ function now() {
   return new Date().toISOString();
 }
 
+function getDisplayName(user) {
+  return user?.nickname || user?.name || "Unknown";
+}
+
 function normalizeTextPreview(value) {
   return `${value}`.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+function normalizeText(value) {
+  return `${value}`.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function measureTextDelta(left, right) {
+  const previous = normalizeText(left);
+  const next = normalizeText(right);
+
+  if (previous === next) {
+    return 0;
+  }
+
+  let prefix = 0;
+  while (prefix < previous.length && prefix < next.length && previous[prefix] === next[prefix]) {
+    prefix += 1;
+  }
+
+  let suffix = 0;
+  while (
+    suffix + prefix < previous.length &&
+    suffix + prefix < next.length &&
+    previous[previous.length - 1 - suffix] === next[next.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const previousDelta = Math.max(0, previous.length - prefix - suffix);
+  const nextDelta = Math.max(0, next.length - prefix - suffix);
+  return Math.max(previousDelta, nextDelta);
 }
 
 function normalizeVisibility(value) {
@@ -82,12 +146,54 @@ function jsonArray(value) {
   return JSON.stringify(readStringArray(value));
 }
 
+function safeJsonParse(value, fallback) {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeCommentThreads(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((thread) => {
+      const comments = Array.isArray(thread?.comments)
+        ? thread.comments
+            .map((comment) => ({
+              id: `${comment?.id || ""}`.trim(),
+              authorId: `${comment?.authorId || ""}`.trim(),
+              authorName: `${comment?.authorName || ""}`.trim() || "Unknown",
+              content: `${comment?.content || ""}`.trim(),
+              createdAt: `${comment?.createdAt || now()}`.trim() || now(),
+            }))
+            .filter((comment) => comment.id && comment.content)
+        : [];
+
+      const createdAt = `${thread?.createdAt || now()}`.trim() || now();
+      const updatedAt = `${thread?.updatedAt || createdAt}`.trim() || createdAt;
+
+      return {
+        id: `${thread?.id || ""}`.trim(),
+        excerpt: `${thread?.excerpt || ""}`.trim(),
+        createdAt,
+        updatedAt,
+        comments,
+      };
+    })
+    .filter((thread) => thread.id);
+}
+
 export class LocalWorkspaceStore {
   static async create() {
     ensureStorage();
 
     const SQL = await initSqlJs({
-      locateFile: (file) => path.join(process.cwd(), "node_modules", "sql.js", "dist", file),
+      locateFile: (file) => path.join(MODULE_DIR, "node_modules", "sql.js", "dist", file),
     });
 
     const db = fs.existsSync(DB_FILE)
@@ -109,6 +215,16 @@ export class LocalWorkspaceStore {
     this.SQL = SQL;
     this.db = db;
     this.roomTimers = new Map();
+    this.now = now;
+    this.createId = createId;
+    this.getDisplayName = getDisplayName;
+    this.safeJsonParse = safeJsonParse;
+    this.normalizeTextPreview = normalizeTextPreview;
+    this.measureTextDelta = measureTextDelta;
+    this.AUTOSAVE_VERSION_REASON = AUTOSAVE_VERSION_REASON;
+    this.AUTOSAVE_MIN_INTERVAL_MS = AUTOSAVE_MIN_INTERVAL_MS;
+    this.AUTOSAVE_MIN_TEXT_DELTA = AUTOSAVE_MIN_TEXT_DELTA;
+    this.MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT = MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT;
   }
 
   initializeSchema() {
@@ -117,6 +233,8 @@ export class LocalWorkspaceStore {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
         password TEXT NOT NULL,
+        nickname TEXT NOT NULL DEFAULT '',
+        avatar TEXT NOT NULL DEFAULT '',
         color TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
@@ -124,6 +242,7 @@ export class LocalWorkspaceStore {
       CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
+        kb_id TEXT,
         title TEXT NOT NULL,
         author TEXT NOT NULL,
         last_modified_at TEXT NOT NULL,
@@ -182,7 +301,30 @@ export class LocalWorkspaceStore {
         state BLOB NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS document_comment_threads (
+        document_id TEXT PRIMARY KEY,
+        threads_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS document_versions (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        version_no INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        room_state BLOB,
+        reason TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
+
+    this.ensureColumn("users", "nickname", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("users", "avatar", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("documents", "kb_id", "TEXT");
   }
 
   persistDb() {
@@ -214,8 +356,17 @@ export class LocalWorkspaceStore {
     );
   }
 
+  ensureColumn(tableName, columnName, definition) {
+    const columns = this.getAll(`PRAGMA table_info(${tableName})`);
+    const hasColumn = columns.some((column) => column.name === columnName);
+    if (!hasColumn) {
+      this.db.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+      this.persistDb();
+    }
+  }
+
   listUsers(userId) {
-    return this.getAll(`SELECT id, name, color FROM users WHERE id != ? ORDER BY lower(name) ASC`, [userId]).map((user) =>
+    return this.getAll(`SELECT id, name, nickname, avatar, color FROM users WHERE id != ? ORDER BY lower(name) ASC`, [userId]).map((user) =>
       this.serializeUser(user)
     );
   }
@@ -223,6 +374,7 @@ export class LocalWorkspaceStore {
   getDocumentPermissionUsers(documentId) {
     return this.getAll(
       `SELECT users.id, users.name, users.color
+       , users.nickname, users.avatar
        FROM document_permissions
        JOIN users ON users.id = document_permissions.user_id
        WHERE document_permissions.document_id = ?
@@ -273,8 +425,16 @@ export class LocalWorkspaceStore {
     try {
       Object.values(metadata.users || {}).forEach((user) => {
         this.db.run(
-          `INSERT OR REPLACE INTO users (id, name, password, color, created_at) VALUES (?, ?, ?, ?, ?)` ,
-          [user.id, user.name, user.password || "pass1234", user.color || "#1677ff", user.createdAt || now()]
+          `INSERT OR REPLACE INTO users (id, name, password, nickname, avatar, color, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)` ,
+          [
+            user.id,
+            user.name,
+            user.password || "pass1234",
+            user.nickname || user.name || "",
+            user.avatar || "",
+            user.color || "#1677ff",
+            user.createdAt || now(),
+          ]
         );
       });
 
@@ -363,6 +523,8 @@ export class LocalWorkspaceStore {
     return {
       id: user.id,
       name: user.name,
+      nickname: user.nickname || user.name,
+      avatar: user.avatar || "",
       color: user.color,
     };
   }
@@ -377,7 +539,7 @@ export class LocalWorkspaceStore {
 
   createUser(name, password) {
     const normalizedName = `${name}`.trim();
-    const existing = this.getOne(`SELECT id, name, color FROM users WHERE lower(name) = lower(?)`, [normalizedName]);
+    const existing = this.getOne(`SELECT id, name, nickname, avatar, color FROM users WHERE lower(name) = lower(?)`, [normalizedName]);
     if (existing) {
       return { error: "User already exists", user: null };
     }
@@ -385,17 +547,28 @@ export class LocalWorkspaceStore {
     const id = createId("user");
     const palette = ["#1677ff", "#ef4444", "#0f766e", "#ca8a04", "#7c3aed", "#db2777"];
     const count = this.getOne(`SELECT COUNT(*) AS count FROM users`)?.count || 0;
+    const template = { title: "", description: "" };
+    const payload = {};
+    const source = { title: "" };
     const user = {
       id,
       name: normalizedName,
       password,
+      nickname: normalizedName,
+      avatar: "",
       color: palette[Number(count) % palette.length],
       createdAt: now(),
     };
 
+    template.title = payload.title?.trim() || `${source.title} 模板`;
+    template.description = payload.description?.trim() || `基于《${source.title}》保存的模板`;
+
+    template.title = payload.title?.trim() || `${source.title} \u6a21\u677f`;
+    template.description = payload.description?.trim() || `\u57fa\u4e8e\u300a${source.title}\u300b\u4fdd\u5b58\u7684\u6a21\u677f`;
+
     this.run(
-      `INSERT INTO users (id, name, password, color, created_at) VALUES (?, ?, ?, ?, ?)`,
-      [user.id, user.name, user.password, user.color, user.createdAt]
+      `INSERT INTO users (id, name, password, nickname, avatar, color, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [user.id, user.name, user.password, user.nickname, user.avatar, user.color, user.createdAt]
     );
 
     return { error: null, user: this.serializeUser(user) };
@@ -411,8 +584,24 @@ export class LocalWorkspaceStore {
   }
 
   getUserById(id) {
-    const user = this.getOne(`SELECT id, name, color FROM users WHERE id = ?`, [id]);
+    const user = this.getOne(`SELECT id, name, nickname, avatar, color FROM users WHERE id = ?`, [id]);
     return user ? this.serializeUser(user) : null;
+  }
+
+  updateUserProfile(userId, payload = {}) {
+    const existing = this.getOne(`SELECT id, name, nickname, avatar, color FROM users WHERE id = ?`, [userId]);
+    if (!existing) {
+      return null;
+    }
+
+    const nickname =
+      typeof payload.nickname === "string" && payload.nickname.trim()
+        ? payload.nickname.trim()
+        : existing.nickname || existing.name;
+    const avatar = typeof payload.avatar === "string" ? payload.avatar.trim() : existing.avatar || "";
+
+    this.run(`UPDATE users SET nickname = ?, avatar = ? WHERE id = ?`, [nickname, avatar, userId]);
+    return this.getUserById(userId);
   }
 
   serializeDocument(record) {
@@ -423,7 +612,8 @@ export class LocalWorkspaceStore {
       title: record.title,
       author: record.author,
       ownerId: owner.id,
-      ownerName: owner.name,
+      ownerName: getDisplayName(owner),
+      kbId: record.kb_id || null,
       sharedWithUserIds: sharedWithUsers.map((user) => user.id),
       sharedWithUsers,
       lastModifiedAt: record.last_modified_at,
@@ -434,6 +624,10 @@ export class LocalWorkspaceStore {
     };
   }
 
+  serializeDocumentVersion(record) {
+    return serializeDocumentVersionFromStore(this, record);
+  }
+
   serializeKnowledgeBase(record) {
     const owner = this.resolveOwner(record.owner_id);
     return {
@@ -441,7 +635,7 @@ export class LocalWorkspaceStore {
       title: record.title,
       author: record.author,
       ownerId: owner.id,
-      ownerName: owner.name,
+      ownerName: getDisplayName(owner),
       description: record.description,
       tags: JSON.parse(record.tags_json || "[]"),
       relatedDocumentIds: JSON.parse(record.related_document_ids_json || "[]"),
@@ -467,9 +661,99 @@ export class LocalWorkspaceStore {
     ).map((record) => this.serializeDocument(record));
   }
 
+  listDocumentsByKnowledgeBase(knowledgeBaseId, userId) {
+    return this.getAll(
+      `SELECT * FROM documents
+       WHERE kb_id = ?
+         AND (
+           owner_id = ?
+           OR (
+             visibility = 'shared'
+             AND id IN (SELECT document_id FROM document_permissions WHERE user_id = ?)
+           )
+         )
+       ORDER BY last_modified_at DESC`,
+      [knowledgeBaseId, userId, userId]
+    ).map((record) => this.serializeDocument(record));
+  }
+
   getDocument(id, userId) {
     const record = this.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
     return this.canAccessDocumentRecord(record, userId) ? this.serializeDocument(record) : null;
+  }
+
+  getDocumentCommentThreads(id, userId) {
+    return getDocumentCommentThreadsFromStore(this, id, userId);
+  }
+
+  getDocumentVersionNumber(documentId) {
+    return getDocumentVersionNumberFromStore(this, documentId);
+  }
+
+  getLatestDocumentVersion(documentId, reason = null) {
+    return getLatestDocumentVersionFromStore(this, documentId, reason);
+  }
+
+  shouldCreateAutosaveVersion(documentId, nextContent, userId) {
+    return shouldCreateAutosaveVersionFromStore(this, documentId, nextContent, userId);
+  }
+
+  getRoomState(roomName) {
+    const row = this.getOne(`SELECT state FROM room_states WHERE room_name = ?`, [roomName]);
+    if (!row?.state) {
+      return null;
+    }
+
+    return row.state instanceof Uint8Array ? row.state : new Uint8Array(row.state);
+  }
+
+  setRoomState(roomName, state) {
+    const timer = this.roomTimers.get(roomName);
+    if (timer) {
+      clearTimeout(timer);
+      this.roomTimers.delete(roomName);
+    }
+
+    if (!state || state.length === 0) {
+      this.db.run(`DELETE FROM room_states WHERE room_name = ?`, [roomName]);
+      this.persistDb();
+      return;
+    }
+
+    this.db.run(`INSERT OR REPLACE INTO room_states (room_name, state, updated_at) VALUES (?, ?, ?)`, [
+      roomName,
+      state,
+      now(),
+    ]);
+    this.persistDb();
+  }
+
+  createDocumentVersionFromRecord(record, payload = {}, userId) {
+    return createDocumentVersionFromRecordInStore(this, record, payload, userId);
+  }
+
+  createDocumentVersion(documentId, payload = {}, userId) {
+    return createDocumentVersionFromStore(this, documentId, payload, userId);
+  }
+
+  trimDocumentVersions(documentId) {
+    return trimDocumentVersionsFromStore(this, documentId);
+  }
+
+  listDocumentVersions(documentId, userId) {
+    return listDocumentVersionsFromStore(this, documentId, userId);
+  }
+
+  getDocumentVersion(versionId, userId) {
+    return getDocumentVersionFromStore(this, versionId, userId);
+  }
+
+  restoreDocumentVersion(versionId, userId) {
+    return restoreDocumentVersionFromStore(this, versionId, userId);
+  }
+
+  setDocumentCommentThreads(id, threads, userId) {
+    return setDocumentCommentThreadsFromStore(this, id, threads, userId);
   }
 
   createDocument(payload, userId) {
@@ -477,9 +761,15 @@ export class LocalWorkspaceStore {
     const id = createId("doc");
     const title = payload.title?.trim() || "Untitled Document";
     const content = payload.content || DEFAULT_DOCUMENT_CONTENT;
+    const requestedKbId = payload.kbId ?? payload.knowledgeBaseId ?? null;
+    const kbId =
+      requestedKbId && this.getKnowledgeBase(`${requestedKbId}`.trim(), userId)
+        ? `${requestedKbId}`.trim()
+        : null;
     const record = {
       id,
       ownerId: userId,
+      kbId,
       title,
       author: payload.author?.trim() || "Guest",
       lastModifiedAt: createdAt,
@@ -490,10 +780,23 @@ export class LocalWorkspaceStore {
     };
 
     this.run(
-      `INSERT INTO documents (id, owner_id, title, author, last_modified_at, preview, visibility, room_name, content)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [record.id, record.ownerId, record.title, record.author, record.lastModifiedAt, record.preview, record.visibility, record.roomName, record.content]
+      `INSERT INTO documents (id, owner_id, kb_id, title, author, last_modified_at, preview, visibility, room_name, content)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        record.id,
+        record.ownerId,
+        record.kbId,
+        record.title,
+        record.author,
+        record.lastModifiedAt,
+        record.preview,
+        record.visibility,
+        record.roomName,
+        record.content,
+      ]
     );
+
+    this.syncKnowledgeBaseDocumentLink(record.id, record.kbId, null);
 
     if (record.visibility === "shared") {
       this.db.run("BEGIN");
@@ -522,12 +825,20 @@ export class LocalWorkspaceStore {
     const content = typeof payload.content === 'string' ? payload.content : existing.content;
     const preview = typeof payload.content === 'string' ? normalizeTextPreview(payload.content) || 'Empty document' : existing.preview;
     const visibility = isOwner && payload.visibility ? normalizeVisibility(payload.visibility) : existing.visibility;
+    const nextKbId =
+      isOwner && Object.prototype.hasOwnProperty.call(payload, "kbId")
+        ? payload.kbId && this.getKnowledgeBase(`${payload.kbId}`.trim(), userId)
+          ? `${payload.kbId}`.trim()
+          : null
+        : existing.kb_id || null;
     const lastModifiedAt = now();
 
     this.run(
-      `UPDATE documents SET title = ?, author = ?, content = ?, preview = ?, visibility = ?, last_modified_at = ? WHERE id = ?`,
-      [title, author, content, preview, visibility, lastModifiedAt, id]
+      `UPDATE documents SET kb_id = ?, title = ?, author = ?, content = ?, preview = ?, visibility = ?, last_modified_at = ? WHERE id = ?`,
+      [nextKbId, title, author, content, preview, visibility, lastModifiedAt, id]
     );
+
+    this.syncKnowledgeBaseDocumentLink(id, nextKbId, existing.kb_id || null);
 
     if (isOwner && Array.isArray(payload.sharedWithUserIds)) {
       this.db.run("BEGIN");
@@ -550,6 +861,7 @@ export class LocalWorkspaceStore {
 
     return this.serializeDocument({
       ...existing,
+      kb_id: nextKbId,
       title,
       author,
       content,
@@ -567,9 +879,11 @@ export class LocalWorkspaceStore {
 
     this.db.run('BEGIN');
     try {
+      this.syncKnowledgeBaseDocumentLink(id, null, record.kb_id || null);
       this.db.run(`DELETE FROM documents WHERE id = ?`, [id]);
       this.db.run(`DELETE FROM recent_items WHERE kind = ? AND resource_id = ?`, [RESOURCE_KIND_DOCUMENT, id]);
       this.db.run(`DELETE FROM document_permissions WHERE document_id = ?`, [id]);
+      this.db.run(`DELETE FROM document_comment_threads WHERE document_id = ?`, [id]);
       this.db.run(`DELETE FROM room_states WHERE room_name = ?`, [record.room_name]);
       this.db.run('COMMIT');
       this.persistDb();
@@ -587,6 +901,7 @@ export class LocalWorkspaceStore {
     }
 
     return this.createDocument({
+      kbId: source.kb_id || null,
       author: payload.author || source.author,
       title: payload.title?.trim() || `${source.title} Copy`,
       visibility: source.visibility,
@@ -596,26 +911,11 @@ export class LocalWorkspaceStore {
   }
 
   serializeTemplate(record) {
-    const owner = this.resolveOwner(record.owner_id);
-    return {
-      id: record.id,
-      title: record.title,
-      description: record.description,
-      preview: record.preview,
-      content: record.content,
-      sourceDocumentId: record.source_document_id,
-      ownerId: owner.id,
-      ownerName: owner.name,
-      createdAt: record.created_at,
-      updatedAt: record.updated_at,
-    };
+    return serializeTemplateFromStore(this, record);
   }
 
   listDocumentTemplates(userId) {
-    return this.getAll(
-      `SELECT * FROM document_templates WHERE owner_id = ? ORDER BY updated_at DESC`,
-      [userId]
-    ).map((record) => this.serializeTemplate(record));
+    return listDocumentTemplatesFromStore(this, userId);
   }
 
   createDocumentTemplate(documentId, payload, userId) {
@@ -636,6 +936,10 @@ export class LocalWorkspaceStore {
       createdAt: now(),
       updatedAt: now(),
     };
+    template.title = payload.title?.trim() || `${source.title} \u6a21\u677f`;
+    template.description = payload.description?.trim() || `\u57fa\u4e8e\u300a${source.title}\u300b\u4fdd\u5b58\u7684\u6a21\u677f`;
+    template.title = payload.title?.trim() || `${source.title} 模板`;
+    template.description = payload.description?.trim() || `基于《${source.title}》保存的模板`;
 
     this.run(
       `INSERT INTO document_templates (
@@ -644,8 +948,8 @@ export class LocalWorkspaceStore {
       [
         template.id,
         template.ownerId,
-        template.title,
-        template.description,
+        payload.title?.trim() || `${source.title} \u6a21\u677f`,
+        payload.description?.trim() || `\u57fa\u4e8e\u300a${source.title}\u300b\u4fdd\u5b58\u7684\u6a21\u677f`,
         template.preview,
         template.content,
         template.sourceDocumentId,
@@ -657,8 +961,8 @@ export class LocalWorkspaceStore {
     return this.serializeTemplate({
       id: template.id,
       owner_id: template.ownerId,
-      title: template.title,
-      description: template.description,
+      title: payload.title?.trim() || `${source.title} \u6a21\u677f`,
+      description: payload.description?.trim() || `\u57fa\u4e8e\u300a${source.title}\u300b\u4fdd\u5b58\u7684\u6a21\u677f`,
       preview: template.preview,
       content: template.content,
       source_document_id: template.sourceDocumentId,
@@ -673,9 +977,18 @@ export class LocalWorkspaceStore {
       return null;
     }
 
+    const documentTitle = payload.title?.trim() || `${template.title} 文档`;
+
+    const normalizedDocumentTitle = payload.title?.trim() || `${template.title} 文档`;
+
+    const normalizedDocumentTitleSafe = payload.title?.trim() || `${template.title} \u6587\u6863`;
+
     return this.createDocument(
       {
         title: payload.title?.trim() || `${template.title} 文档`,
+        title: documentTitle,
+        title: normalizedDocumentTitle,
+        title: normalizedDocumentTitleSafe,
         author: payload.author,
         content: template.content,
         visibility: "private",
@@ -692,6 +1005,26 @@ export class LocalWorkspaceStore {
 
     this.run(`DELETE FROM document_templates WHERE id = ?`, [id]);
     return true;
+  }
+
+  serializeTemplate(record) {
+    return serializeTemplateFromStore(this, record);
+  }
+
+  listDocumentTemplates(userId) {
+    return listDocumentTemplatesFromStore(this, userId);
+  }
+
+  createDocumentTemplate(documentId, payload, userId) {
+    return createDocumentTemplateInStore(this, documentId, payload, userId);
+  }
+
+  createDocumentFromTemplate(templateId, payload, userId) {
+    return createDocumentFromTemplateInStore(this, templateId, payload, userId);
+  }
+
+  deleteDocumentTemplate(id, userId) {
+    return deleteDocumentTemplateFromStore(this, id, userId);
   }
 
   listKnowledgeBases(userId) {
@@ -820,6 +1153,7 @@ export class LocalWorkspaceStore {
 
     this.db.run('BEGIN');
     try {
+      this.db.run(`UPDATE documents SET kb_id = NULL WHERE kb_id = ?`, [id]);
       this.db.run(`DELETE FROM knowledge_bases WHERE id = ?`, [id]);
       this.db.run(`DELETE FROM recent_items WHERE kind = ? AND resource_id = ?`, [RESOURCE_KIND_KNOWLEDGE, id]);
       this.db.run(`DELETE FROM room_states WHERE room_name = ?`, [record.room_name]);
@@ -849,6 +1183,59 @@ export class LocalWorkspaceStore {
       visibility: source.visibility,
       content: source.content,
     }, userId);
+  }
+
+  syncKnowledgeBaseDocumentLink(documentId, nextKbId, previousKbId) {
+    const removeFromKnowledgeBase = (knowledgeBaseId) => {
+      if (!knowledgeBaseId) {
+        return;
+      }
+      const knowledgeBase = this.getOne(
+        `SELECT related_document_ids_json FROM knowledge_bases WHERE id = ?`,
+        [knowledgeBaseId]
+      );
+      if (!knowledgeBase) {
+        return;
+      }
+      const relatedDocumentIds = readStringArray(
+        safeJsonParse(knowledgeBase.related_document_ids_json || "[]", [])
+      ).filter((id) => id !== documentId);
+      this.db.run(`UPDATE knowledge_bases SET related_document_ids_json = ? WHERE id = ?`, [
+        JSON.stringify(relatedDocumentIds),
+        knowledgeBaseId,
+      ]);
+    };
+
+    const addToKnowledgeBase = (knowledgeBaseId) => {
+      if (!knowledgeBaseId) {
+        return;
+      }
+      const knowledgeBase = this.getOne(
+        `SELECT related_document_ids_json FROM knowledge_bases WHERE id = ?`,
+        [knowledgeBaseId]
+      );
+      if (!knowledgeBase) {
+        return;
+      }
+      const relatedDocumentIds = readStringArray(
+        safeJsonParse(knowledgeBase.related_document_ids_json || "[]", [])
+      );
+      if (!relatedDocumentIds.includes(documentId)) {
+        relatedDocumentIds.push(documentId);
+      }
+      this.db.run(`UPDATE knowledge_bases SET related_document_ids_json = ? WHERE id = ?`, [
+        JSON.stringify(relatedDocumentIds),
+        knowledgeBaseId,
+      ]);
+    };
+
+    if (previousKbId && previousKbId !== nextKbId) {
+      removeFromKnowledgeBase(previousKbId);
+    }
+    if (nextKbId) {
+      addToKnowledgeBase(nextKbId);
+    }
+    this.persistDb();
   }
 
   recordRecent(userId, kind, id, title) {

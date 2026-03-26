@@ -1,13 +1,13 @@
 // 导入相关的库和模块
-import * as Y from "yjs"; // 导入Yjs库，用于协作文档管理
-import * as syncProtocol from "y-protocols/sync"; // 导入同步协议
-import * as awarenessProtocol from "y-protocols/awareness"; // 导入意识协议
+import * as Y from "yjs";
+import * as syncProtocol from "y-protocols/sync";
+import * as awarenessProtocol from "y-protocols/awareness";
 
-import * as encoding from "lib0/encoding"; // 导入编码模块
-import * as decoding from "lib0/decoding"; // 导入解码模块
-import * as map from "lib0/map"; // 导入map模块
+import * as encoding from "lib0/encoding";
+import * as decoding from "lib0/decoding";
+import * as map from "lib0/map";
 
-import * as eventloop from "lib0/eventloop"; // 导入事件循环模块
+import * as eventloop from "lib0/eventloop";
 
 import { callbackHandler, isCallbackSet } from "./callback.js"; // 导入回调处理相关模块
 
@@ -66,7 +66,7 @@ const messageAwareness = 1;
  * @param {any} _tr - 事务（在此不使用）
  */
 const updateHandler = (update, _origin, doc, _tr) => {
-  const encoder = encoding.createEncoder(); // 创建编码器
+  const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, messageSync); // 写入消息类型
   syncProtocol.writeUpdate(encoder, update); // 将更新写入编码器
   const message = encoding.toUint8Array(encoder); // 转换为Uint8Array
