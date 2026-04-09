@@ -1,3 +1,4 @@
+// 封装文档版本快照、恢复流程和保留策略。
 export function serializeDocumentVersion(store, record) {
   const createdBy = store.resolveOwner(record.created_by);
   const roomState =

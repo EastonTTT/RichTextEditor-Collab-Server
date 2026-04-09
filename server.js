@@ -1,5 +1,6 @@
 ﻿import express from "express";
 import cors from "cors";
+// 承载 REST API、导入流程、AI 接口和 WebSocket 协同服务。
 import http from "http";
 import { WebSocketServer } from "ws";
 import multer from "multer";

@@ -1,3 +1,4 @@
+// 创建协同 WebSocket 服务使用的 HTTP 回调入口。
 import http from "http";
 import * as number from "lib0/number";
 

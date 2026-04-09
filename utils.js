@@ -1,5 +1,6 @@
 // 导入相关的库和模块
 import * as Y from "yjs";
+// 负责衔接 Yjs 文档持久化与 WebSocket 协同服务。
 import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
 

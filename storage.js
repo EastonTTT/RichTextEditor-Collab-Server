@@ -1,3 +1,4 @@
+// 实现基于 SQLite 和房间状态持久化的本地工作区存储。
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

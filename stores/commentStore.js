@@ -1,3 +1,4 @@
+// 处理评论线程标准化及持久化辅助逻辑。
 export function normalizeCommentThreads(value, now) {
   if (!Array.isArray(value)) {
     return [];

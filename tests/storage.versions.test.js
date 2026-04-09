@@ -1,3 +1,4 @@
+// 覆盖文档版本创建、裁剪与恢复相关的持久化规则测试。
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";

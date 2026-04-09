@@ -1,3 +1,4 @@
+// 封装文档模板序列化及增删改查辅助逻辑。
 export function serializeTemplate(store, record) {
   const owner = store.resolveOwner(record.owner_id);
   return {
