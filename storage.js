@@ -332,6 +332,30 @@ export class LocalWorkspaceStore {
     fs.writeFileSync(DB_FILE, Buffer.from(this.db.export()));
   }
 
+  runTransaction(task, options = {}) {
+    const { persist = true } = options;
+    let committed = false;
+    this.db.run("BEGIN");
+    try {
+      const result = task();
+      this.db.run("COMMIT");
+      committed = true;
+      if (persist) {
+        this.persistDb();
+      }
+      return result;
+    } catch (error) {
+      if (!committed) {
+        try {
+          this.db.run("ROLLBACK");
+        } catch {
+          // Ignore rollback failures after transaction state has already been cleared.
+        }
+      }
+      throw error;
+    }
+  }
+
   run(sql, params = []) {
     this.db.run(sql, params);
     this.persistDb();
@@ -800,15 +824,9 @@ export class LocalWorkspaceStore {
     this.syncKnowledgeBaseDocumentLink(record.id, record.kbId, null);
 
     if (record.visibility === "shared") {
-      this.db.run("BEGIN");
-      try {
+      this.runTransaction(() => {
         this.syncDocumentPermissions(record.id, payload.sharedWithUserIds);
-        this.db.run("COMMIT");
-        this.persistDb();
-      } catch (error) {
-        this.db.run("ROLLBACK");
-        throw error;
-      }
+      });
     }
 
     return this.getDocument(record.id, userId);
@@ -842,15 +860,9 @@ export class LocalWorkspaceStore {
     this.syncKnowledgeBaseDocumentLink(id, nextKbId, existing.kb_id || null);
 
     if (isOwner && Array.isArray(payload.sharedWithUserIds)) {
-      this.db.run("BEGIN");
-      try {
+      this.runTransaction(() => {
         this.syncDocumentPermissions(id, visibility === "shared" ? payload.sharedWithUserIds : []);
-        this.db.run("COMMIT");
-        this.persistDb();
-      } catch (error) {
-        this.db.run("ROLLBACK");
-        throw error;
-      }
+      });
     } else if (visibility !== "shared") {
       this.db.run(`DELETE FROM document_permissions WHERE document_id = ?`, [id]);
       this.persistDb();
@@ -878,21 +890,15 @@ export class LocalWorkspaceStore {
       return false;
     }
 
-    this.db.run('BEGIN');
-    try {
-      this.syncKnowledgeBaseDocumentLink(id, null, record.kb_id || null);
+    return this.runTransaction(() => {
+      this.syncKnowledgeBaseDocumentLink(id, null, record.kb_id || null, { persist: false });
       this.db.run(`DELETE FROM documents WHERE id = ?`, [id]);
       this.db.run(`DELETE FROM recent_items WHERE kind = ? AND resource_id = ?`, [RESOURCE_KIND_DOCUMENT, id]);
       this.db.run(`DELETE FROM document_permissions WHERE document_id = ?`, [id]);
       this.db.run(`DELETE FROM document_comment_threads WHERE document_id = ?`, [id]);
       this.db.run(`DELETE FROM room_states WHERE room_name = ?`, [record.room_name]);
-      this.db.run('COMMIT');
-      this.persistDb();
       return true;
-    } catch (error) {
-      this.db.run('ROLLBACK');
-      throw error;
-    }
+    });
   }
 
   duplicateDocument(id, payload, userId) {
@@ -1152,19 +1158,13 @@ export class LocalWorkspaceStore {
       return false;
     }
 
-    this.db.run('BEGIN');
-    try {
+    return this.runTransaction(() => {
       this.db.run(`UPDATE documents SET kb_id = NULL WHERE kb_id = ?`, [id]);
       this.db.run(`DELETE FROM knowledge_bases WHERE id = ?`, [id]);
       this.db.run(`DELETE FROM recent_items WHERE kind = ? AND resource_id = ?`, [RESOURCE_KIND_KNOWLEDGE, id]);
       this.db.run(`DELETE FROM room_states WHERE room_name = ?`, [record.room_name]);
-      this.db.run('COMMIT');
-      this.persistDb();
       return true;
-    } catch (error) {
-      this.db.run('ROLLBACK');
-      throw error;
-    }
+    });
   }
 
   duplicateKnowledgeBase(id, payload, userId) {
@@ -1186,7 +1186,8 @@ export class LocalWorkspaceStore {
     }, userId);
   }
 
-  syncKnowledgeBaseDocumentLink(documentId, nextKbId, previousKbId) {
+  syncKnowledgeBaseDocumentLink(documentId, nextKbId, previousKbId, options = {}) {
+    const { persist = true } = options;
     const removeFromKnowledgeBase = (knowledgeBaseId) => {
       if (!knowledgeBaseId) {
         return;
@@ -1236,7 +1237,9 @@ export class LocalWorkspaceStore {
     if (nextKbId) {
       addToKnowledgeBase(nextKbId);
     }
-    this.persistDb();
+    if (persist) {
+      this.persistDb();
+    }
   }
 
   recordRecent(userId, kind, id, title) {
@@ -1284,17 +1287,11 @@ export class LocalWorkspaceStore {
     });
 
     if (staleIds.length > 0) {
-      this.db.run("BEGIN");
-      try {
+      this.runTransaction(() => {
         staleIds.forEach((id) => {
           this.db.run(`DELETE FROM recent_items WHERE user_id = ? AND kind = ? AND resource_id = ?`, [userId, kind, id]);
         });
-        this.db.run("COMMIT");
-        this.persistDb();
-      } catch (error) {
-        this.db.run("ROLLBACK");
-        throw error;
-      }
+      });
     }
 
     return visibleItems;

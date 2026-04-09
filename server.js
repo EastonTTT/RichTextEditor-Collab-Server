@@ -125,8 +125,35 @@ function stripHtml(html = "") {
   return `${html}`.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function normalizeUploadFileName(fileName = "") {
+  const rawName = `${fileName || ""}`.trim();
+  if (!rawName) {
+    return "";
+  }
+
+  try {
+    const decodedName = Buffer.from(rawName, "latin1").toString("utf8").trim();
+    if (!decodedName) {
+      return rawName;
+    }
+
+    const rawCjkCount = (rawName.match(/[\u4e00-\u9fff]/g) || []).length;
+    const decodedCjkCount = (decodedName.match(/[\u4e00-\u9fff]/g) || []).length;
+    const rawLooksMojibake = /[ÃÂÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞãæçèéêëìíîïðñòóôõöøùúûüýþ]/.test(rawName);
+
+    if (decodedCjkCount > rawCjkCount || rawLooksMojibake) {
+      return decodedName;
+    }
+  } catch {
+    // Fall back to the raw upload name if charset conversion fails.
+  }
+
+  return rawName;
+}
+
 async function importFileToHtml(file) {
-  const extension = file.originalname.toLowerCase().split(".").pop();
+  const normalizedFileName = normalizeUploadFileName(file.originalname);
+  const extension = normalizedFileName.toLowerCase().split(".").pop();
 
   if (extension === "docx") {
     const { value } = await mammoth.convertToHtml({ buffer: file.buffer });
@@ -396,6 +423,7 @@ app.post("/api/documents/import", upload.single("file"), async (req, res) => {
   }
 
   try {
+    const normalizedFileName = normalizeUploadFileName(req.file.originalname);
     const html = await importFileToHtml(req.file);
     if (!html) {
       sendError(res, 400, "Only .doc, .docx and .pdf files are supported");
@@ -404,9 +432,10 @@ app.post("/api/documents/import", upload.single("file"), async (req, res) => {
 
     const title = `${req.body?.title || req.file.originalname.replace(/\.[^.]+$/, "")}`.trim() || "导入文档";
     const author = `${req.body?.author || ""}`.trim();
+    const normalizedTitle = `${req.body?.title || normalizedFileName.replace(/\.[^.]+$/, "")}`.trim() || "导入文档";
     const record = store.createDocument(
       {
-        title,
+        title: normalizedTitle,
         author,
         content: html,
         visibility: "private",
