@@ -15,12 +15,14 @@ export function serializeTemplate(store, record) {
   };
 }
 
+// 模板是“用户私有资源”，当前只允许 owner 自己查看和使用。
 export function listDocumentTemplates(store, userId) {
   return store
     .getAll(`SELECT * FROM document_templates WHERE owner_id = ? ORDER BY updated_at DESC`, [userId])
     .map((record) => serializeTemplate(store, record));
 }
 
+// 从现有文档生成模板，本质上是把文档当前内容冻结成一个可复用快照。
 export function createDocumentTemplate(store, documentId, payload, userId) {
   const source = store.getOne(`SELECT * FROM documents WHERE id = ?`, [documentId]);
   if (!source || source.owner_id !== userId) {
@@ -73,6 +75,7 @@ export function createDocumentTemplate(store, documentId, payload, userId) {
   });
 }
 
+// 根据模板新建文档时，不会共享模板本身，只是复制其中的内容。
 export function createDocumentFromTemplate(store, templateId, payload, userId) {
   const template = store.getOne(`SELECT * FROM document_templates WHERE id = ? AND owner_id = ?`, [templateId, userId]);
   if (!template) {

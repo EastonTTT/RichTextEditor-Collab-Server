@@ -13,6 +13,11 @@ import * as eventloop from "lib0/eventloop";
 import { callbackHandler, isCallbackSet } from "./callback.js"; // 导入回调处理相关模块
 
 // 回调防抖的相关配置
+// 协同层总览：
+// 1. 为每个 room 维护一个 WSSharedDoc（Y.Doc 的子类）
+// 2. 负责处理 WebSocket 消息、在线状态、心跳和断线清理
+// 3. 把 Yjs 文档变化广播给其他客户端
+// 4. 与 storage.js 提供的持久化适配器对接，把房间状态写入 SQLite
 const CALLBACK_DEBOUNCE_WAIT = parseInt(
   process.env.CALLBACK_DEBOUNCE_WAIT || "2000"
 );
@@ -66,6 +71,8 @@ const messageAwareness = 1;
  * @param {WSSharedDoc} doc - 当前文档
  * @param {any} _tr - 事务（在此不使用）
  */
+// 文档有更新时，把二进制增量消息广播给当前房间内的其他连接。
+// 这是协同编辑实时同步的核心逻辑之一。
 const updateHandler = (update, _origin, doc, _tr) => {
   const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, messageSync); // 写入消息类型
@@ -101,6 +108,8 @@ export class WSSharedDoc extends Y.Doc {
     this.awareness.setLocalState(null); // 初始化本地状态为空
 
     // 定义意识状态更新的处理函数
+    // awareness 用来同步“谁在线、光标在哪、选区在哪”等临时状态。
+    // 它和文档正文不同，不会直接写进最终内容。
     const awarenessChangeHandler = ({ added, updated, removed }, conn) => {
       const changedClients = added.concat(updated, removed); // 合并状态变化的客户端
       console.log(
@@ -145,6 +154,8 @@ export class WSSharedDoc extends Y.Doc {
     this.on("update", /** @type {any} */ (updateHandler));
 
     // 如果设置了回调，则进行防抖处理
+    // 如果配置了回调地址，则在文档更新后防抖触发一次 HTTP 回调。
+    // 适合把协同文档内容同步给外部系统。
     if (isCallbackSet) {
       this.on("update", (_update, _origin, doc) => {
         debouncer(() => callbackHandler(/** @type {WSSharedDoc} */ (doc)));
@@ -162,6 +173,7 @@ export class WSSharedDoc extends Y.Doc {
  * @param {boolean} gc - 是否启用GC（仅在创建时生效）
  * @return {WSSharedDoc} 返回文档实例
  */
+// 按房间名获取 Y.Doc；如果内存里还没有，就现场创建并绑定持久化层。
 export const getYDoc = (docname, gc = true) =>
   map.setIfUndefined(docs, docname, () => {
     const doc = new WSSharedDoc(docname);
@@ -185,6 +197,10 @@ export const getYDoc = (docname, gc = true) =>
  * @param {WSSharedDoc} doc - 文档实例
  * @param {Uint8Array} message - 接收到的消息
  */
+// 解析客户端发来的 WebSocket 消息。
+// 当前只处理两类：
+// - sync: 文档增量同步
+// - awareness: 在线状态 / 光标状态同步
 const messageListener = (conn, doc, message) => {
   try {
     const encoder = encoding.createEncoder();
@@ -227,6 +243,10 @@ const messageListener = (conn, doc, message) => {
  * @param {WSSharedDoc} doc - 文档实例
  * @param {any} conn - WebSocket连接
  */
+// 连接关闭时需要做三件事：
+// 1. 从当前文档的连接集合中移除它
+// 2. 清理该连接控制的 awareness 状态
+// 3. 如果房间里没人了，则触发持久化并销毁内存中的 doc
 const closeConn = (doc, conn) => {
   if (doc.conns.has(conn)) {
     console.warn(
@@ -259,6 +279,7 @@ const closeConn = (doc, conn) => {
  * @param {import('ws').WebSocket} conn - WebSocket连接
  * @param {Uint8Array} m - 要发送的消息
  */
+// 统一的发送封装，顺手处理“连接已断开但还试图发送”这类异常场景。
 const send = (doc, conn, m) => {
   if (
     conn.readyState !== wsReadyStateConnecting &&
@@ -297,6 +318,11 @@ const pingTimeout = 30000;
  * @param {import('http').IncomingMessage} req - 请求对象
  * @param {any} opts - 配置选项
  */
+// 一个新 WebSocket 连接建立后，会在这里完成所有初始化：
+// 1. 找到或创建对应房间的 Y.Doc
+// 2. 注册 message / close / pong 监听
+// 3. 启动心跳检测
+// 4. 发送首次同步消息和 awareness 状态
 export const setupWSConnection = (
   conn,
   req,

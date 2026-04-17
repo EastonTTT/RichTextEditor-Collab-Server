@@ -2,6 +2,8 @@
 import http from "http";
 import * as number from "lib0/number";
 
+// 这是一个可选扩展点：
+// 如果配置了 CALLBACK_URL，协同文档更新后会把指定共享对象序列化后 POST 出去。
 const CALLBACK_URL = process.env.CALLBACK_URL
   ? new URL(process.env.CALLBACK_URL)
   : null;
@@ -14,6 +16,7 @@ const CALLBACK_OBJECTS = process.env.CALLBACK_OBJECTS
 
 export const isCallbackSet = !!CALLBACK_URL;
 
+// 把当前房间里指定的共享对象提取出来，组装成统一的回调载荷。
 /**
  * @param {import('./utils.js').WSSharedDoc} doc
  */
@@ -34,6 +37,8 @@ export const callbackHandler = (doc) => {
   CALLBACK_URL && callbackRequest(CALLBACK_URL, CALLBACK_TIMEOUT, dataToSend);
 };
 
+// 使用最基础的 http.request 发 POST，
+// 避免为了一个简单回调再额外引入第三方请求库。
 /**
  * @param {URL} url
  * @param {number} timeout
@@ -65,6 +70,8 @@ const callbackRequest = (url, timeout, data) => {
   req.end();
 };
 
+// 根据共享对象类型从 Y.Doc 中取出目标对象。
+// 只有配置在 CALLBACK_OBJECTS 中的对象才会被序列化并回调出去。
 /**
  * @param {string} objName
  * @param {string} objType

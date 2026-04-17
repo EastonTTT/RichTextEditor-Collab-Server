@@ -32,6 +32,7 @@ export function normalizeCommentThreads(value, now) {
     .filter((thread) => thread.id);
 }
 
+// 读取文档评论线程前，先复用文档权限判断，确保无权用户拿不到评论内容。
 export function getDocumentCommentThreads(store, id, userId) {
   const record = store.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
   if (!store.canAccessDocumentRecord(record, userId)) {
@@ -43,6 +44,7 @@ export function getDocumentCommentThreads(store, id, userId) {
   return normalizeCommentThreads(parsed, store.now);
 }
 
+// 评论线程整体以 JSON 的形式存储在单独的表里，适合当前项目规模和结构。
 export function setDocumentCommentThreads(store, id, threads, userId) {
   const record = store.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
   if (!store.canAccessDocumentRecord(record, userId)) {

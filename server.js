@@ -15,6 +15,10 @@ import {
 import { sendError, sendSuccess } from "./response.js";
 import { docs as activeDocs, setPersistence, setupWSConnection } from "./utils.js";
 
+// 这是整个后端的总入口：
+// - Express 负责普通 HTTP / REST API
+// - ws + Yjs 负责协同编辑 WebSocket
+// - storage.js 负责把业务数据和房间状态落到本地 SQLite
 const HOST = process.env.HOST || "localhost";
 const PORT = Number(process.env.PORT || "8888");
 const app = express();
@@ -30,11 +34,16 @@ const AI_API_URL = process.env.AI_API_URL || "https://api.openai.com/v1/chat/com
 const AI_API_KEY = process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "";
 const AI_MODEL = process.env.AI_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
+// 把 storage 暴露成 Yjs 需要的持久化适配器。
+// 这样协同编辑产生的房间状态就能自动写进 SQLite。
 setPersistence(store.createPersistence());
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// 这个项目的 token 非常轻量：
+// 前端只要传 `Bearer user-xxx` 或 `Bearer local-xxx`，
+// 这里就会提取出真正的用户 id `xxx`。
 function parseUserId(req) {
   const authorization = req.headers.authorization || "";
   const token = authorization.startsWith("Bearer ")
@@ -56,6 +65,8 @@ function parseUserId(req) {
   return token.replace(/^(local|user)-/, "") || null;
 }
 
+// 统一的接口鉴权中间件。
+// 从这里之后的 `/api/*` 路由都必须先拿到合法 userId。
 function requireAuth(req, res, next) {
   const userId = parseUserId(req);
   if (!userId || !store.getUserById(userId)) {
@@ -71,6 +82,8 @@ function logRequest(resource, action, id) {
   console.log(`[API] ${resource} ${action}${id ? ` -> ${id}` : ""}`);
 }
 
+// 当文档权限变更后，把当前房间里已经失去访问权的连接主动踢下线。
+// 否则前端虽然已经无权访问，旧的 WebSocket 连接还会继续保留。
 function disconnectUnauthorizedRoomClients(roomName) {
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) {
@@ -89,6 +102,8 @@ function disconnectUnauthorizedRoomClients(roomName) {
   });
 }
 
+// 用于“整个房间需要重置”的场景，比如恢复版本。
+// 关闭后前端会重新进入房间，从而拿到新的协同状态。
 function disconnectRoomClients(roomName, code = 4002, reason = "room-reset") {
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) {
@@ -103,6 +118,8 @@ function disconnectRoomClients(roomName, code = 4002, reason = "room-reset") {
   });
 }
 
+// 下面几个工具函数主要服务于文件导入和 AI 摘要：
+// 文档里的内容统一会被整理成 HTML，再给前端编辑器使用。
 function escapeHtml(value = "") {
   return `${value}`
     .replace(/&/g, "&amp;")
@@ -151,6 +168,8 @@ function normalizeUploadFileName(fileName = "") {
   return rawName;
 }
 
+// 导入流程统一把不同格式的文件转换成 HTML。
+// 这样存到数据库后，前端富文本编辑器可以直接展示和编辑。
 async function importFileToHtml(file) {
   const normalizedFileName = normalizeUploadFileName(file.originalname);
   const extension = normalizedFileName.toLowerCase().split(".").pop();
@@ -178,6 +197,11 @@ async function importFileToHtml(file) {
 
   return null;
 }
+
+// AI 功能的统一封装：
+// - `summary` 模式：做文档总结
+// - `question` 模式：基于文档内容回答问题
+// 这里没有做复杂检索，直接把文档内容拼进 prompt。
 async function askAiAboutDocument({ title, content, prompt, mode }) {
   if (!AI_API_KEY) {
     throw new Error("AI API is not configured. Please set AI_API_KEY or OPENAI_API_KEY in CollabServer.");
@@ -229,6 +253,8 @@ function createRuntimeId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// 新评论结构是 thread -> comments，
+// 但旧前端接口使用扁平评论列表，所以这里做一次兼容转换。
 function flattenThreadsToLegacyComments(threads = []) {
   const comments = [];
 
@@ -254,6 +280,8 @@ function flattenThreadsToLegacyComments(threads = []) {
   return comments.sort((left, right) => new Date(right.createTime).getTime() - new Date(left.createTime).getTime());
 }
 
+// 旧评论发布接口只传 parentId/content，
+// 这里把它包装成新的评论线程结构后再落库。
 function appendLegacyCommentToThreads(threads = [], { parentId, authorId, content }) {
   const createdAt = new Date().toISOString();
   const author = store.getUserById(authorId);
@@ -307,6 +335,7 @@ app.get("/status", (_req, res) => {
   });
 });
 
+// 运行时指标接口，比 `/status` 额外多返回当前活跃连接数。
 app.get("/metrics", (_req, res) => {
   sendSuccess(res, {
     stats: store.getStats(),
@@ -314,6 +343,8 @@ app.get("/metrics", (_req, res) => {
   });
 });
 
+// 认证相关接口：
+// 当前是本地用户体系，适合单机开发和演示环境。
 app.post("/api/auth/register", (req, res) => {
   const name = `${req.body?.name || req.body?.username || ""}`.trim();
   const password = `${req.body?.password || ""}`;
@@ -364,6 +395,7 @@ app.post("/api/auth/login", (req, res) => {
   );
 });
 
+// 从这里开始统一要求登录态。
 app.use("/api", requireAuth);
 
 app.get("/api/auth/me", (req, res) => {
@@ -390,6 +422,8 @@ app.get("/api/users", (req, res) => {
   sendSuccess(res, store.listUsers(req.userId));
 });
 
+// 文档接口是前端最常调用的一组接口：
+// 列表、详情、创建、保存、版本、评论基本都围绕这部分展开。
 app.get("/api/documents", (req, res) => {
   logRequest("documents", "list");
   sendSuccess(res, store.listDocuments(req.userId));
@@ -416,6 +450,8 @@ app.post("/api/documents", (req, res) => {
   sendSuccess(res, record, "created");
 });
 
+// 文件导入接口的输出仍然是一个普通文档记录，
+// 前端后续的编辑和保存流程与普通文档保持一致。
 app.post("/api/documents/import", upload.single("file"), async (req, res) => {
   if (!req.file) {
     sendError(res, 400, "File is required");
@@ -481,6 +517,8 @@ app.patch("/api/documents/:id/comment-threads", (req, res) => {
   sendSuccess(res, updated, "updated");
 });
 
+// 这是“手动保存文档”的核心接口。
+// 它更新 documents 表中的 HTML 内容，并在合适时机补一份版本快照。
 app.patch("/api/documents/:id", (req, res) => {
   const existing = store.getDocument(req.params.id, req.userId);
   if (!existing) {
@@ -519,6 +557,8 @@ app.patch("/api/documents/:id", (req, res) => {
   sendSuccess(res, record, "updated");
 });
 
+// 版本系统接口：
+// 支持列出版本、创建版本、查看单个版本、恢复版本。
 app.get("/api/documents/:id/versions", (req, res) => {
   const versions = store.listDocumentVersions(req.params.id, req.userId);
   if (versions === null) {
@@ -609,6 +649,8 @@ app.post("/api/documents/:id/open", (req, res) => {
   sendSuccess(res, true, "opened");
 });
 
+// 文档 AI 问答 / 摘要接口。
+// 适合前端在“问 AI”面板中直接调用。
 app.post("/api/documents/:id/ai", async (req, res) => {
   const record = store.getDocument(req.params.id, req.userId);
   if (!record) {
@@ -639,6 +681,7 @@ app.post("/api/documents/:id/ai", async (req, res) => {
   }
 });
 
+// 这个接口不依赖文档 id，前端可以把当前编辑器内容直接传过来做摘要。
 app.post("/api/editor/summary", async (req, res) => {
   const content = `${req.body?.content || ""}`.trim();
   if (!content) {
@@ -661,6 +704,8 @@ app.post("/api/editor/summary", async (req, res) => {
   }
 });
 
+// 旧评论接口：
+// 路由名字保留旧格式，但底层已经切换成新的 thread 存储结构。
 app.get("/api/comment/commentLists", (req, res) => {
   const documentId = `${req.query.textId || ""}`.trim();
   const page = Math.max(1, Number(req.query.page || 1));
@@ -720,6 +765,8 @@ app.post("/api/comment/publish", (req, res) => {
   );
 });
 
+// 模板接口：
+// 支持把现有文档沉淀成模板，再由模板快速创建新文档。
 app.get("/api/document-templates", (req, res) => {
   sendSuccess(res, store.listDocumentTemplates(req.userId));
 });
@@ -754,6 +801,8 @@ app.delete("/api/document-templates/:id", (req, res) => {
   sendSuccess(res, true, "deleted");
 });
 
+// 知识库接口：
+// 和文档类似，但多了 description/tags/关联关系等字段。
 app.get("/api/knowledge-bases", (req, res) => {
   logRequest("knowledge-bases", "list");
   sendSuccess(res, store.listKnowledgeBases(req.userId));
@@ -826,6 +875,8 @@ app.post("/api/knowledge-bases/:id/open", (req, res) => {
 
 const server = http.createServer(app);
 
+// WebSocket 握手阶段就先校验权限：
+// 用户必须存在，且必须有权访问对应 room，才允许升级成功。
 server.on("upgrade", (req, socket, head) => {
   const userId = parseUserId(req);
   const roomName = (req.url || "").slice(1).split("?")[0];
@@ -843,6 +894,8 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+// 握手完成后，真正把连接交给协同层处理。
+// 之后这条连接的同步、心跳、房间状态都由 utils.js 接管。
 wss.on("connection", (ws, req) => {
   ws.userId = req.userId || null;
   ws.roomName = (req.url || "").slice(1).split("?")[0] || null;
@@ -865,6 +918,7 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+// 启动后，一个端口同时承载 REST 和 WebSocket 两种通信。
 server.listen(PORT, HOST, () => {
   console.log(`Server is running on http://${HOST}:${PORT}`);
 });

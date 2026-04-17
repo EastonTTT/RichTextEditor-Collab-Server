@@ -28,6 +28,11 @@ import {
   serializeTemplate as serializeTemplateFromStore,
 } from "./stores/templateStore.js";
 
+// 存储层总览：
+// 1. 用 sql.js 在本地维护一个 SQLite 数据库
+// 2. 管理用户、文档、知识库、评论、模板、版本等业务数据
+// 3. 保存协同编辑房间的 Yjs 二进制状态
+// 4. 向上给 server.js 暴露统一的 LocalWorkspaceStore
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.WORKSPACE_DATA_DIR || path.join(process.cwd(), "data"));
 const ROOMS_DIR = path.join(DATA_DIR, "rooms");
@@ -44,6 +49,9 @@ const AUTOSAVE_MIN_INTERVAL_MS = Number(process.env.AUTOSAVE_MIN_INTERVAL_MS || 
 const AUTOSAVE_MIN_TEXT_DELTA = Number(process.env.AUTOSAVE_MIN_TEXT_DELTA || 80);
 const MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT = Number(process.env.MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT || 20);
 
+// 初始化本地存储目录。
+// 即使主存储已经切到 SQLite，也会保留 metadata.json 这个旧入口，
+// 这样首次启动时仍然能兼容历史数据迁移。
 function ensureStorage() {
   fs.mkdirSync(ROOMS_DIR, { recursive: true });
 
@@ -77,6 +85,7 @@ function createId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// 统一用 ISO 时间字符串，方便数据库存储、排序和接口返回。
 function now() {
   return new Date().toISOString();
 }
@@ -120,6 +129,7 @@ function measureTextDelta(left, right) {
   return Math.max(previousDelta, nextDelta);
 }
 
+// 当前只支持 private/shared 两种可见性，其余值一律回退到 private。
 function normalizeVisibility(value) {
   return value === "shared" ? "shared" : "private";
 }
@@ -190,6 +200,11 @@ function normalizeCommentThreads(value) {
 }
 
 export class LocalWorkspaceStore {
+  // 异步工厂：
+  // 1. 加载 sql.js 运行时
+  // 2. 打开本地 SQLite 文件
+  // 3. 建表
+  // 4. 若数据库文件不存在，则把旧 JSON / rooms 数据迁移进来
   static async create() {
     ensureStorage();
 
@@ -212,6 +227,7 @@ export class LocalWorkspaceStore {
     return store;
   }
 
+  // 构造函数主要缓存依赖和配置，不直接执行业务逻辑。
   constructor(SQL, db) {
     this.SQL = SQL;
     this.db = db;
@@ -228,6 +244,8 @@ export class LocalWorkspaceStore {
     this.MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT = MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT;
   }
 
+  // 在启动时声明所有表结构。
+  // 这个项目没有专门拆 migration 文件，而是采用轻量级的“启动时自修复 schema”方案。
   initializeSchema() {
     this.db.run(`
       CREATE TABLE IF NOT EXISTS users (
@@ -328,10 +346,13 @@ export class LocalWorkspaceStore {
     this.ensureColumn("documents", "kb_id", "TEXT");
   }
 
+  // sql.js 是内存数据库，这里会把整个数据库导出到磁盘文件。
+  // 实现简单，适合当前这种本地协同服务。
   persistDb() {
     fs.writeFileSync(DB_FILE, Buffer.from(this.db.export()));
   }
 
+  // 多步写操作统一走事务，避免写到一半失败导致数据不一致。
   runTransaction(task, options = {}) {
     const { persist = true } = options;
     let committed = false;
@@ -356,6 +377,9 @@ export class LocalWorkspaceStore {
     }
   }
 
+  // 轻量 SQL 工具层：
+  // - run: 执行写操作并立即持久化
+  // - getOne/getAll: 查询后自动转为对象结构，方便业务层直接使用
   run(sql, params = []) {
     this.db.run(sql, params);
     this.persistDb();
@@ -408,6 +432,7 @@ export class LocalWorkspaceStore {
     ).map((user) => this.serializeUser(user));
   }
 
+  // 共享用户权限采用“先删后插”的全量同步方式，逻辑更直观。
   syncDocumentPermissions(documentId, userIds = []) {
     const uniqueUserIds = Array.from(new Set(readStringArray(userIds)));
 
@@ -420,6 +445,10 @@ export class LocalWorkspaceStore {
     });
   }
 
+  // 文档访问控制是整个系统的核心守门逻辑：
+  // - owner 永远可以访问
+  // - private 文档只有 owner 可访问
+  // - shared 文档还必须命中 document_permissions 授权表
   canAccessDocumentRecord(record, userId) {
     if (!record) {
       return false;
@@ -438,6 +467,8 @@ export class LocalWorkspaceStore {
     );
   }
 
+  // 兼容旧版本数据。
+  // 如果发现还没有 SQLite 文件，就把 metadata.json 和 rooms/*.bin 里的内容搬进新库。
   migrateFromLegacyFiles() {
     const metadata = readJsonFile(METADATA_FILE, {
       users: {},
@@ -544,6 +575,7 @@ export class LocalWorkspaceStore {
     }
   }
 
+  // 下面这些 serialize* 方法负责把数据库记录整理成更适合前端直接消费的结构。
   serializeUser(user) {
     return {
       id: user.id,
@@ -562,6 +594,8 @@ export class LocalWorkspaceStore {
     };
   }
 
+  // 用户体系非常轻量，适合本地演示和学习场景。
+  // 这里只做最基本的重名校验，并不会做密码加密或复杂安全策略。
   createUser(name, password) {
     const normalizedName = `${name}`.trim();
     const existing = this.getOne(`SELECT id, name, nickname, avatar, color FROM users WHERE lower(name) = lower(?)`, [normalizedName]);
@@ -629,6 +663,8 @@ export class LocalWorkspaceStore {
     return this.getUserById(userId);
   }
 
+  // 文档序列化时会顺手补出 owner 和共享用户信息，
+  // 这样前端拿到一条文档记录后就可以直接渲染。
   serializeDocument(record) {
     const owner = this.resolveOwner(record.owner_id);
     const sharedWithUsers = this.getDocumentPermissionUsers(record.id);
@@ -686,6 +722,8 @@ export class LocalWorkspaceStore {
     ).map((record) => this.serializeDocument(record));
   }
 
+  // 知识库与文档通过 kb_id 建立一对多关系。
+  // 这里会把指定知识库下、且当前用户有权限访问的文档全部查出来。
   listDocumentsByKnowledgeBase(knowledgeBaseId, userId) {
     return this.getAll(
       `SELECT * FROM documents
@@ -707,6 +745,8 @@ export class LocalWorkspaceStore {
     return this.canAccessDocumentRecord(record, userId) ? this.serializeDocument(record) : null;
   }
 
+  // 评论、版本等规则被拆到了 stores/* 模块中；
+  // storage.js 自身负责把统一的 store 上下文传过去。
   getDocumentCommentThreads(id, userId) {
     return getDocumentCommentThreadsFromStore(this, id, userId);
   }
@@ -732,6 +772,8 @@ export class LocalWorkspaceStore {
     return row.state instanceof Uint8Array ? row.state : new Uint8Array(row.state);
   }
 
+  // 某些场景需要直接覆盖房间状态，例如恢复版本或清空房间。
+  // 这里不是等待协同层自然回写，而是立即写库。
   setRoomState(roomName, state) {
     const timer = this.roomTimers.get(roomName);
     if (timer) {
@@ -781,6 +823,10 @@ export class LocalWorkspaceStore {
     return setDocumentCommentThreadsFromStore(this, id, threads, userId);
   }
 
+  // 文档创建流程：
+  // 1. 创建 documents 主记录
+  // 2. 如有知识库归属，则同步维护知识库关联
+  // 3. 如是共享文档，则同步共享用户权限
   createDocument(payload, userId) {
     const createdAt = now();
     const id = createId("doc");
@@ -832,6 +878,8 @@ export class LocalWorkspaceStore {
     return this.getDocument(record.id, userId);
   }
 
+  // 文档更新是最常用的写操作。
+  // 除了 title/content，还会处理可见性、共享权限、所属知识库以及房间状态清理。
   updateDocument(id, payload, userId) {
     const existing = this.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
     if (!this.canAccessDocumentRecord(existing, userId)) {
@@ -890,6 +938,7 @@ export class LocalWorkspaceStore {
       return false;
     }
 
+    // 删除文档时要一并清掉关联数据，避免留下脏权限、评论和房间状态。
     return this.runTransaction(() => {
       this.syncKnowledgeBaseDocumentLink(id, null, record.kb_id || null, { persist: false });
       this.db.run(`DELETE FROM documents WHERE id = ?`, [id]);
@@ -901,6 +950,7 @@ export class LocalWorkspaceStore {
     });
   }
 
+  // 复制文档本质上就是拿原文档内容和部分属性重新创建一份新记录。
   duplicateDocument(id, payload, userId) {
     const source = this.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
     if (!this.canAccessDocumentRecord(source, userId)) {
@@ -1034,6 +1084,8 @@ export class LocalWorkspaceStore {
     return deleteDocumentTemplateFromStore(this, id, userId);
   }
 
+  // 知识库访问控制比文档简单：
+  // 当前只有 owner 或 visibility=shared 两种访问来源。
   listKnowledgeBases(userId) {
     return this.getAll(
       `SELECT * FROM knowledge_bases WHERE owner_id = ? OR visibility = 'shared' ORDER BY last_modified_at DESC`,
@@ -1096,6 +1148,7 @@ export class LocalWorkspaceStore {
     return this.getKnowledgeBase(record.id, userId);
   }
 
+  // 知识库结构与文档相似，但多了描述、标签以及关联资源字段。
   updateKnowledgeBase(id, payload, userId) {
     const existing = this.getOne(`SELECT * FROM knowledge_bases WHERE id = ?`, [id]);
     if (!existing || (existing.owner_id !== userId && existing.visibility !== 'shared')) {
@@ -1152,6 +1205,7 @@ export class LocalWorkspaceStore {
     });
   }
 
+  // 删除知识库时不删除文档本身，只把相关文档的 kb_id 清空。
   deleteKnowledgeBase(id, userId) {
     const record = this.getOne(`SELECT * FROM knowledge_bases WHERE id = ?`, [id]);
     if (!record || record.owner_id !== userId) {
@@ -1186,6 +1240,9 @@ export class LocalWorkspaceStore {
     }, userId);
   }
 
+  // 同步维护“知识库 <-> 文档”的关联关系。
+  // 文档表里有 kb_id，知识库表里又额外保留 related_document_ids_json，
+  // 这里负责保证两边尽量一致。
   syncKnowledgeBaseDocumentLink(documentId, nextKbId, previousKbId, options = {}) {
     const { persist = true } = options;
     const removeFromKnowledgeBase = (knowledgeBaseId) => {
@@ -1242,6 +1299,7 @@ export class LocalWorkspaceStore {
     }
   }
 
+  // 最近打开记录按用户和资源类型分别维护，并限制每类最多保留 10 条。
   recordRecent(userId, kind, id, title) {
     this.db.run(
       `INSERT OR REPLACE INTO recent_items (user_id, kind, resource_id, title, opened_at) VALUES (?, ?, ?, ?, ?)`,
@@ -1297,6 +1355,10 @@ export class LocalWorkspaceStore {
     return visibleItems;
   }
 
+  // 协同房间命名规则：
+  // - `document:xxx` 表示文档房间
+  // - `knowledge:xxx` 表示知识库房间
+  // WebSocket 握手时会用它做权限校验。
   canAccessRoom(roomName, userId) {
     const [resourcePrefix, id] = `${roomName}`.split(':');
     if (!resourcePrefix || !id) {
@@ -1325,6 +1387,10 @@ export class LocalWorkspaceStore {
     };
   }
 
+  // 下面这组方法专门服务于 Yjs 协同层：
+  // - loadRoomState:   从数据库恢复房间状态
+  // - persistRoomState:把当前 Y.Doc 编码后写回数据库
+  // - scheduleRoomWrite:做防抖，避免每次编辑都立即落盘
   loadRoomState(roomName, doc) {
     const row = this.getOne(`SELECT state FROM room_states WHERE room_name = ?`, [roomName]);
     if (!row?.state) {
@@ -1370,6 +1436,8 @@ export class LocalWorkspaceStore {
     this.run(`DELETE FROM room_states WHERE room_name = ?`, [roomName]);
   }
 
+  // 给 utils.js 提供的 Yjs persistence 适配器。
+  // 协同层只知道 bindState / writeState，不需要感知底层是 SQLite。
   createPersistence() {
     return {
       bindState: (roomName, doc) => {

@@ -23,6 +23,7 @@ export function serializeDocumentVersion(store, record) {
   };
 }
 
+// 下一个版本号按“当前最大版本号 + 1”计算，保证单文档内版本号递增。
 export function getDocumentVersionNumber(store, documentId) {
   const row = store.getOne(`SELECT COALESCE(MAX(version_no), 0) AS version_no FROM document_versions WHERE document_id = ?`, [
     documentId,
@@ -43,6 +44,10 @@ export function getLatestDocumentVersion(store, documentId, reason = null) {
   return store.getOne(sql, params);
 }
 
+// 自动保存的判定规则：
+// 1. 用户对文档仍有访问权
+// 2. 距离上次 autosave 已经过去足够久
+// 3. 这次文本变化量达到阈值
 export function shouldCreateAutosaveVersion(store, documentId, nextContent, userId) {
   const record = store.getOne(`SELECT * FROM documents WHERE id = ?`, [documentId]);
   if (!store.canAccessDocumentRecord(record, userId) || typeof nextContent !== "string") {
@@ -61,6 +66,7 @@ export function shouldCreateAutosaveVersion(store, documentId, nextContent, user
   return store.measureTextDelta(baselineContent, nextContent) >= store.AUTOSAVE_MIN_TEXT_DELTA;
 }
 
+// 自动保存版本会限制保留窗口，避免单篇文档无限累积历史快照。
 export function trimDocumentVersions(store, documentId) {
   if (store.MAX_AUTOSAVE_VERSIONS_PER_DOCUMENT < 1) {
     return;
@@ -91,6 +97,8 @@ export function trimDocumentVersions(store, documentId) {
   }
 }
 
+// 基于当前文档记录创建一个完整版本快照。
+// 除了 title/content，还会把 room_state 一起保存，方便后续完整恢复。
 export function createDocumentVersionFromRecord(store, record, payload = {}, userId) {
   if (!record || !store.canAccessDocumentRecord(record, userId)) {
     return null;
@@ -174,6 +182,10 @@ export function getDocumentVersion(store, versionId, userId) {
   return serializeDocumentVersion(store, version);
 }
 
+// 恢复版本的关键点：
+// 1. 先给当前状态做一份 restore_backup
+// 2. 再把目标版本的 title/content/room_state 写回
+// 3. 最后再记一份 restore 版本，保留恢复操作痕迹
 export function restoreDocumentVersion(store, versionId, userId) {
   const version = store.getOne(`SELECT * FROM document_versions WHERE id = ?`, [versionId]);
   if (!version) {
