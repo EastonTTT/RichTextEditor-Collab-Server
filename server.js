@@ -558,7 +558,7 @@ app.patch("/api/documents/:id", (req, res) => {
 });
 
 // 版本系统接口：
-// 支持列出版本、创建版本、查看单个版本、恢复版本。
+// 支持列出版本、创建版本、查看单个版本、恢复版本和删除版本。
 app.get("/api/documents/:id/versions", (req, res) => {
   const versions = store.listDocumentVersions(req.params.id, req.userId);
   if (versions === null) {
@@ -601,7 +601,7 @@ app.post("/api/document-versions/:id/restore", (req, res) => {
     return;
   }
 
-  const record = store.restoreDocumentVersion(req.params.id, req.userId);
+  const record = store.restoreDocumentVersion(req.params.id, req.body || {}, req.userId);
   if (!record) {
     sendError(res, 403, "You are not allowed to restore this version");
     return;
@@ -614,6 +614,22 @@ app.post("/api/document-versions/:id/restore", (req, res) => {
   }, 100);
 
   sendSuccess(res, record, "restored");
+});
+
+app.delete("/api/document-versions/:id", (req, res) => {
+  const version = store.getDocumentVersion(req.params.id, req.userId);
+  if (!version) {
+    sendError(res, 404, "Version not found");
+    return;
+  }
+
+  const removed = store.deleteDocumentVersion(req.params.id, req.userId);
+  if (!removed) {
+    sendError(res, 403, "You are not allowed to delete this version");
+    return;
+  }
+
+  sendSuccess(res, true, "deleted");
 });
 
 app.delete("/api/documents/:id", (req, res) => {

@@ -51,13 +51,67 @@ test("document version restore brings back content and room state", async () => 
     fixture.store.updateDocument(document.id, { content: "<p>second draft</p>" }, owner.id);
     fixture.store.setRoomState(document.roomName, new Uint8Array([7, 8, 9]));
 
-    const restored = fixture.store.restoreDocumentVersion(baselineVersion.id, owner.id);
+    const restored = fixture.store.restoreDocumentVersion(
+      baselineVersion.id,
+      {
+        createBackup: true,
+        currentTitle: "Spec working copy",
+        currentContent: "<p>second draft from editor</p>",
+      },
+      owner.id
+    );
     assert.equal(restored?.content, "<p>first draft</p>");
     assert.deepEqual(Array.from(fixture.store.getRoomState(document.roomName) || []), [1, 2, 3, 4]);
 
     const versions = fixture.store.listDocumentVersions(document.id, owner.id) || [];
-    assert.ok(versions.some((version) => version.reason === "restore_backup"));
-    assert.ok(versions.some((version) => version.reason === "restore"));
+    assert.equal(versions[0]?.id, baselineVersion.id);
+    assert.equal(versions[0]?.lastRestoredAt, restored?.lastModifiedAt);
+
+    const backupVersion = versions.find((version) => version.reason === "restore_backup");
+    assert.ok(backupVersion);
+    assert.equal(backupVersion?.title, "Spec working copy");
+    assert.equal(backupVersion?.content, "<p>second draft from editor</p>");
+    assert.ok(!versions.some((version) => version.reason === "restore"));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("document version restore can skip backup creation", async () => {
+  const fixture = await createStore("restore-without-backup");
+  try {
+    const owner = fixture.store.createUser("dave", "pass1234").user;
+    assert.ok(owner);
+
+    const document = fixture.store.createDocument(
+      {
+        title: "Plan",
+        content: "<p>baseline</p>",
+      },
+      owner.id
+    );
+
+    const baselineVersion = fixture.store.createDocumentVersion(
+      document.id,
+      { reason: "manual_snapshot", summary: "baseline" },
+      owner.id
+    );
+    fixture.store.updateDocument(document.id, { content: "<p>draft</p>" }, owner.id);
+
+    const restored = fixture.store.restoreDocumentVersion(
+      baselineVersion.id,
+      {
+        createBackup: false,
+        currentContent: "<p>draft from editor</p>",
+      },
+      owner.id
+    );
+
+    assert.equal(restored?.content, "<p>baseline</p>");
+    const versions = fixture.store.listDocumentVersions(document.id, owner.id) || [];
+    assert.equal(versions[0]?.id, baselineVersion.id);
+    assert.ok(!versions.some((version) => version.reason === "restore_backup"));
+    assert.ok(!versions.some((version) => version.reason === "restore"));
   } finally {
     fixture.cleanup();
   }

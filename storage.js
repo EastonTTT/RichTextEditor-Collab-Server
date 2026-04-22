@@ -11,6 +11,7 @@ import {
 import {
   createDocumentVersion as createDocumentVersionFromStore,
   createDocumentVersionFromRecord as createDocumentVersionFromRecordInStore,
+  deleteDocumentVersion as deleteDocumentVersionFromStore,
   getDocumentVersion as getDocumentVersionFromStore,
   getDocumentVersionNumber as getDocumentVersionNumberFromStore,
   getLatestDocumentVersion as getLatestDocumentVersionFromStore,
@@ -337,13 +338,15 @@ export class LocalWorkspaceStore {
         reason TEXT NOT NULL,
         summary TEXT NOT NULL,
         created_by TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        last_restored_at TEXT NOT NULL DEFAULT ''
       );
     `);
 
     this.ensureColumn("users", "nickname", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("users", "avatar", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("documents", "kb_id", "TEXT");
+    this.ensureColumn("document_versions", "last_restored_at", "TEXT NOT NULL DEFAULT ''");
   }
 
   // sql.js 是内存数据库，这里会把整个数据库导出到磁盘文件。
@@ -815,8 +818,12 @@ export class LocalWorkspaceStore {
     return getDocumentVersionFromStore(this, versionId, userId);
   }
 
-  restoreDocumentVersion(versionId, userId) {
-    return restoreDocumentVersionFromStore(this, versionId, userId);
+  restoreDocumentVersion(versionId, payload, userId) {
+    return restoreDocumentVersionFromStore(this, versionId, payload, userId);
+  }
+
+  deleteDocumentVersion(versionId, userId) {
+    return deleteDocumentVersionFromStore(this, versionId, userId);
   }
 
   setDocumentCommentThreads(id, threads, userId) {
