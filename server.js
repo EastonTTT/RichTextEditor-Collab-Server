@@ -517,6 +517,26 @@ app.patch("/api/documents/:id/comment-threads", (req, res) => {
   sendSuccess(res, updated, "updated");
 });
 
+app.delete("/api/documents/:id/comment-threads/:threadId/comments/:commentId", (req, res) => {
+  const result = store.deleteDocumentComment(req.params.id, req.params.threadId, req.params.commentId, req.userId);
+  if (result?.status === "document_not_found") {
+    sendError(res, 404, "Document not found");
+    return;
+  }
+
+  if (result?.status === "forbidden") {
+    sendError(res, 403, "Only document owner can delete comments");
+    return;
+  }
+
+  if (result?.status === "comment_not_found") {
+    sendError(res, 404, "Comment not found");
+    return;
+  }
+
+  sendSuccess(res, result?.threads || [], "deleted");
+});
+
 // 这是“手动保存文档”的核心接口。
 // 它更新 documents 表中的 HTML 内容，并在合适时机补一份版本快照。
 app.patch("/api/documents/:id", (req, res) => {

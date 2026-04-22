@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import initSqlJs from "sql.js";
 import * as Y from "yjs";
 import {
+  deleteDocumentComment as deleteDocumentCommentFromStore,
   getDocumentCommentThreads as getDocumentCommentThreadsFromStore,
   setDocumentCommentThreads as setDocumentCommentThreadsFromStore,
 } from "./stores/commentStore.js";
@@ -828,6 +829,10 @@ export class LocalWorkspaceStore {
 
   setDocumentCommentThreads(id, threads, userId) {
     return setDocumentCommentThreadsFromStore(this, id, threads, userId);
+  }
+
+  deleteDocumentComment(id, threadId, commentId, userId) {
+    return deleteDocumentCommentFromStore(this, id, threadId, commentId, userId);
   }
 
   // 文档创建流程：

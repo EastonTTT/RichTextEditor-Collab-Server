@@ -32,6 +32,10 @@ export function normalizeCommentThreads(value, now) {
     .filter((thread) => thread.id);
 }
 
+function buildThreadExcerpt(content) {
+  return `${content || ""}`.trim().replace(/\s+/g, " ").slice(0, 60);
+}
+
 // 读取文档评论线程前，先复用文档权限判断，确保无权用户拿不到评论内容。
 export function getDocumentCommentThreads(store, id, userId) {
   const record = store.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
@@ -63,4 +67,67 @@ export function setDocumentCommentThreads(store, id, threads, userId) {
   );
 
   return normalizedThreads;
+}
+
+export function deleteDocumentComment(store, id, threadId, commentId, userId) {
+  const record = store.getOne(`SELECT * FROM documents WHERE id = ?`, [id]);
+  if (!record) {
+    return { status: "document_not_found" };
+  }
+
+  if (!store.canAccessDocumentRecord(record, userId)) {
+    return { status: "document_not_found" };
+  }
+
+  if (record.owner_id !== userId) {
+    return { status: "forbidden" };
+  }
+
+  const currentThreads = getDocumentCommentThreads(store, id, userId) || [];
+  let removed = false;
+  const updatedAt = store.now();
+  const nextThreads = currentThreads
+    .map((thread) => {
+      if (thread.id !== threadId) {
+        return thread;
+      }
+
+      const nextComments = thread.comments.filter((comment) => {
+        const shouldKeep = comment.id !== commentId;
+        if (!shouldKeep) {
+          removed = true;
+        }
+        return shouldKeep;
+      });
+
+      if (nextComments.length === 0) {
+        return null;
+      }
+
+      return {
+        ...thread,
+        excerpt: buildThreadExcerpt(nextComments[0]?.content || thread.excerpt),
+        updatedAt,
+        comments: nextComments,
+      };
+    })
+    .filter(Boolean);
+
+  if (!removed) {
+    return { status: "comment_not_found" };
+  }
+
+  store.run(
+    `INSERT INTO document_comment_threads (document_id, threads_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(document_id) DO UPDATE SET
+       threads_json = excluded.threads_json,
+       updated_at = excluded.updated_at`,
+    [id, JSON.stringify(nextThreads), updatedAt]
+  );
+
+  return {
+    status: "ok",
+    threads: nextThreads,
+  };
 }
